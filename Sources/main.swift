@@ -121,6 +121,7 @@ struct StatusSnapshot {
     var latencyMs: Int?
     var lastCheck: Date?
     var errorMessage: String?
+    var history: [Bool?] = []
 
     var statusText: String {
         switch mode {
@@ -148,7 +149,7 @@ struct StatusSnapshot {
     }
 
     static var loading: StatusSnapshot {
-        StatusSnapshot(mode: .loading, uptimePct: nil, latencyMs: nil, lastCheck: nil, errorMessage: nil)
+        StatusSnapshot(mode: .loading, uptimePct: nil, latencyMs: nil, lastCheck: nil, errorMessage: nil, history: [])
     }
 }
 
@@ -172,7 +173,8 @@ final class StatusMonitor: ObservableObject {
                     uptimePct: nil,
                     latencyMs: nil,
                     lastCheck: Date(),
-                    errorMessage: "未找到模型"
+                    errorMessage: "未找到模型",
+                    history: []
                 )
                 onChange?()
                 return
@@ -185,7 +187,8 @@ final class StatusMonitor: ObservableObject {
                 uptimePct: service.uptime_pct,
                 latencyMs: last?.latency_ms,
                 lastCheck: date(from: last?.ts ?? payload.generated_at),
-                errorMessage: last?.error
+                errorMessage: last?.error,
+                history: recentHistory(from: service.history)
             )
             onChange?()
         } catch {
@@ -194,7 +197,8 @@ final class StatusMonitor: ObservableObject {
                 uptimePct: nil,
                 latencyMs: nil,
                 lastCheck: Date(),
-                errorMessage: "请求失败"
+                errorMessage: "请求失败",
+                history: []
             )
             onChange?()
         }
@@ -203,6 +207,12 @@ final class StatusMonitor: ObservableObject {
     private func date(from timestamp: Int?) -> Date? {
         guard let timestamp else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(timestamp))
+    }
+
+    private func recentHistory(from samples: [StatusSample]) -> [Bool?] {
+        let recent = samples.suffix(30).map { Optional($0.ok) }
+        let missing = max(0, 30 - recent.count)
+        return Array(repeating: nil, count: missing) + recent
     }
 }
 
@@ -216,6 +226,7 @@ struct StatusService: Decodable {
     let model: String
     let uptime_pct: Double
     let last: StatusSample?
+    let history: [StatusSample]
 }
 
 struct StatusSample: Decodable {
@@ -275,7 +286,7 @@ struct StatusPopoverView: View {
             Divider()
                 .overlay(Color.white.opacity(0.20))
 
-            StatusBarsView(color: snapshot.barColor, count: barCount)
+            StatusBarsView(samples: snapshot.history, fallbackColor: snapshot.barColor, count: barCount)
                 .frame(height: 18)
                 .shadow(color: snapshot.barColor.opacity(0.24), radius: 3, x: 0, y: 0)
 
@@ -318,16 +329,30 @@ struct StatusPopoverView: View {
 }
 
 struct StatusBarsView: View {
-    let color: Color
+    let samples: [Bool?]
+    let fallbackColor: Color
     let count: Int
 
     var body: some View {
         HStack(spacing: 2) {
-            ForEach(0..<count, id: \.self) { _ in
+            ForEach(0..<count, id: \.self) { index in
                 RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(color)
+                    .fill(color(for: sample(at: index)))
                     .frame(maxWidth: .infinity)
             }
+        }
+    }
+
+    private func sample(at index: Int) -> Bool? {
+        guard index < samples.count else { return nil }
+        return samples[index]
+    }
+
+    private func color(for sample: Bool?) -> Color {
+        switch sample {
+        case .some(true): return .green
+        case .some(false): return .red
+        case .none: return fallbackColor.opacity(0.32)
         }
     }
 }
