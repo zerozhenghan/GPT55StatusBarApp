@@ -121,6 +121,7 @@ struct StatusSnapshot {
     var latencyMs: Int?
     var lastCheck: Date?
     var errorMessage: String?
+    var isStale: Bool = false
     var history: [Bool?] = []
 
     var statusText: String {
@@ -143,13 +144,13 @@ struct StatusSnapshot {
     var barColor: Color {
         switch mode {
         case .healthy: return .green
-        case .failing, .error: return .red
-        case .loading: return .gray
+        case .failing: return .red
+        case .error, .loading: return .gray
         }
     }
 
     static var loading: StatusSnapshot {
-        StatusSnapshot(mode: .loading, uptimePct: nil, latencyMs: nil, lastCheck: nil, errorMessage: nil, history: [])
+        StatusSnapshot(mode: .loading, uptimePct: nil, latencyMs: nil, lastCheck: nil, errorMessage: nil, isStale: false, history: [])
     }
 }
 
@@ -160,11 +161,15 @@ final class StatusMonitor: ObservableObject {
 
     func refresh() async {
         do {
-            var request = URLRequest(url: apiURL, timeoutInterval: 5)
+            var request = URLRequest(url: apiURL, timeoutInterval: 12)
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             request.setValue("GPT55StatusBarApp", forHTTPHeaderField: "User-Agent")
 
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200...299).contains(httpResponse.statusCode) {
+                throw URLError(.badServerResponse)
+            }
             let payload = try JSONDecoder().decode(StatusResponse.self, from: data)
 
             guard let service = payload.services.first(where: { $0.model == modelName }) else {
@@ -174,6 +179,7 @@ final class StatusMonitor: ObservableObject {
                     latencyMs: nil,
                     lastCheck: Date(),
                     errorMessage: "未找到模型",
+                    isStale: false,
                     history: []
                 )
                 onChange?()
@@ -188,18 +194,12 @@ final class StatusMonitor: ObservableObject {
                 latencyMs: last?.latency_ms,
                 lastCheck: date(from: last?.ts ?? payload.generated_at),
                 errorMessage: last?.error,
+                isStale: false,
                 history: recentHistory(from: service.history)
             )
             onChange?()
         } catch {
-            snapshot = StatusSnapshot(
-                mode: .error,
-                uptimePct: nil,
-                latencyMs: nil,
-                lastCheck: Date(),
-                errorMessage: "请求失败",
-                history: []
-            )
+            snapshot = failedRefreshSnapshot(from: snapshot)
             onChange?()
         }
     }
@@ -213,6 +213,30 @@ final class StatusMonitor: ObservableObject {
         let recent = samples.suffix(30).map { Optional($0.ok) }
         let missing = max(0, 30 - recent.count)
         return Array(repeating: nil, count: missing) + recent
+    }
+
+    private func failedRefreshSnapshot(from current: StatusSnapshot) -> StatusSnapshot {
+        guard !current.history.isEmpty else {
+            return StatusSnapshot(
+                mode: .error,
+                uptimePct: nil,
+                latencyMs: nil,
+                lastCheck: Date(),
+                errorMessage: "请求失败",
+                isStale: false,
+                history: []
+            )
+        }
+
+        return StatusSnapshot(
+            mode: current.mode,
+            uptimePct: current.uptimePct,
+            latencyMs: current.latencyMs,
+            lastCheck: current.lastCheck,
+            errorMessage: "刷新失败，显示上次数据",
+            isStale: true,
+            history: current.history
+        )
     }
 }
 
@@ -279,7 +303,12 @@ struct StatusPopoverView: View {
                 GlassStatLine(systemImage: "calendar", label: "最近检查", value: lastCheckText(snapshot.lastCheck))
 
                 if let errorMessage = snapshot.errorMessage, !errorMessage.isEmpty {
-                    GlassStatLine(systemImage: "exclamationmark.triangle", label: "错误", value: errorMessage)
+                    GlassStatLine(
+                        systemImage: snapshot.isStale ? "arrow.clockwise.icloud" : "exclamationmark.triangle",
+                        label: snapshot.isStale ? "提示" : "错误",
+                        value: errorMessage,
+                        isMuted: snapshot.isStale
+                    )
                 }
             }
 
@@ -361,22 +390,23 @@ struct GlassStatLine: View {
     let systemImage: String
     let label: String
     let value: String
+    var isMuted: Bool = false
 
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: systemImage)
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(Color.black.opacity(0.56))
+                .foregroundStyle(Color.black.opacity(isMuted ? 0.38 : 0.56))
                 .frame(width: 16)
 
             Text(label)
                 .font(.system(size: 12, weight: .medium, design: .default))
-                .foregroundStyle(Color.black.opacity(0.66))
+                .foregroundStyle(Color.black.opacity(isMuted ? 0.46 : 0.66))
                 .frame(width: 58, alignment: .leading)
 
             Text(value)
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color.black.opacity(0.82))
+                .foregroundStyle(Color.black.opacity(isMuted ? 0.60 : 0.82))
                 .lineLimit(1)
                 .minimumScaleFactor(0.86)
                 .shadow(color: Color.black.opacity(0.08), radius: 1, x: 0, y: 1)
