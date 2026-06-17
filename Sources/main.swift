@@ -207,7 +207,6 @@ struct UsageSnapshot {
     var remaining: Double?
     var unit: String
     var todayCost: Double?
-    var todayRequests: Int?
     var todayLimit: Double?
     var week: Double?
     var weekLimit: Double?
@@ -243,7 +242,6 @@ struct UsageSnapshot {
             remaining: nil,
             unit: "USD",
             todayCost: nil,
-            todayRequests: nil,
             todayLimit: nil,
             week: nil,
             weekLimit: nil,
@@ -262,7 +260,6 @@ struct UsageSnapshot {
             remaining: remaining,
             unit: unit,
             todayCost: todayCost,
-            todayRequests: todayRequests,
             todayLimit: todayLimit,
             week: week,
             weekLimit: weekLimit,
@@ -281,7 +278,6 @@ struct UsageSnapshot {
             remaining: remaining,
             unit: unit,
             todayCost: todayCost,
-            todayRequests: todayRequests,
             todayLimit: todayLimit,
             week: week,
             weekLimit: weekLimit,
@@ -490,17 +486,13 @@ final class StatusMonitor: ObservableObject {
 
         let value = try JSONDecoder().decode(JSONValue.self, from: data)
         let isValid = value.bool(at: [["is_active"], ["isValid"], ["valid"], ["subscription", "active"]]) ?? true
-        let today = value.value(at: [["usage", "today"]])
-        let todayCost = today?.double(at: [["actual_cost"], ["cost"]])
-        let todayRequests = today?.int(at: [["requests"]])
         let subscription = value.value(at: [["subscription"]])
         return UsageSnapshot(
             mode: isValid ? .valid : .invalid,
             accountName: config.name,
             remaining: value.double(at: [["remaining"], ["quota", "remaining"], ["balance"], ["data", "remaining"]]),
             unit: value.string(at: [["unit"], ["quota", "unit"], ["currency"]]) ?? previous.unit,
-            todayCost: todayCost ?? value.double(at: [["today"], ["today_cost"], ["usage", "today"], ["costs", "today"], ["daily"]]),
-            todayRequests: todayRequests,
+            todayCost: subscription?.double(at: [["daily_usage_usd"]]) ?? value.double(at: [["today"], ["today_cost"], ["usage", "today"], ["costs", "today"], ["daily"]]),
             todayLimit: subscription?.double(at: [["daily_limit_usd"]]),
             week: subscription?.double(at: [["weekly_usage_usd"]]) ?? value.double(at: [["week"], ["week_cost"], ["usage", "week"], ["costs", "week"], ["weekly"]]),
             weekLimit: subscription?.double(at: [["weekly_limit_usd"]]),
@@ -958,9 +950,6 @@ struct UsageCardView: View {
                             .foregroundStyle(Color.white.opacity(0.92))
                     }
                     Spacer()
-                    Text("余额 \(moneyText(usage.remaining, unit: usage.unit))")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(Color.white.opacity(0.38))
                 }
 
                 Text(usage.mode == .loading ? "正在刷新" : usageStatusLine(usage))
@@ -986,7 +975,7 @@ struct UsageCardView: View {
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(Color.white.opacity(0.90))
 
-                UsageLine(label: "今日", value: usageAmountText(usage.todayCost, limit: usage.todayLimit, unit: usage.unit), trailing: usageTodayMeta(usage))
+                UsageLine(label: "今日", value: usageAmountText(usage.todayCost, limit: usage.todayLimit, unit: usage.unit), trailing: nil)
                 UsageLine(label: "本周", value: usageAmountText(usage.week, limit: usage.weekLimit, unit: usage.unit), trailing: nil)
                 UsageLine(label: "本月", value: usageAmountText(usage.month, limit: usage.monthLimit, unit: usage.unit), trailing: nil)
 
@@ -1023,13 +1012,6 @@ struct UsageCardView: View {
         let current = moneyText(value, unit: unit)
         guard let limit else { return "\(current) / ∞" }
         return "\(current) / \(currencyText(limit, unit: unit))"
-    }
-
-    private func usageTodayMeta(_ usage: UsageSnapshot) -> String? {
-        if let requests = usage.todayRequests {
-            return "\(requests) 次"
-        }
-        return nil
     }
 
     private func expireText(_ date: Date?) -> String {
