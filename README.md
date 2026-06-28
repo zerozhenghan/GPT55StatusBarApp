@@ -12,7 +12,7 @@
 
 ## 功能
 
-- 菜单栏显示 `GPT-5.5`
+- 菜单栏默认显示主站点今日消耗，也可以通过配置切换为余额、耗时、状态或模型名
 - 每 60 秒请求一次 `https://status.input.im/api/status`
 - 只监控 `gpt-5.5`
 - 下拉面板显示深色毛玻璃状态面板、60 段状态条、打开状态页、手动刷新
@@ -34,10 +34,54 @@ INPUT_IM_BASE_URL=https://ai.input.im
 INPUT_IM_ACCOUNT_NAME=Codex
 ```
 
-也支持只写一行 Key：
+多站点示例：
+
+```env
+# 原站点
+INPUT_IM_ACCOUNT_NAME=Codex
+INPUT_IM_BASE_URL=https://ai.input.im
+INPUT_IM_API_KEY=你的原站点 Key
+
+# Lucen
+LUCEN_ACCOUNT_NAME=Lucen
+LUCEN_BASE_URL=https://lucen.cc
+LUCEN_API_KEY=你的 Lucen Key
+```
+
+如果只写一行 Key，会默认当作 Lucen Key：
 
 ```env
 你的 API Key
+```
+
+### 菜单栏显示设置
+
+菜单栏默认显示第一个可用站点的今日消耗，只显示具体数值和单位：
+
+```env
+MENU_BAR_DISPLAY=today_cost
+```
+
+如果要改成余额：
+
+```env
+MENU_BAR_DISPLAY=balance
+```
+
+可选值：
+
+- `today_cost`：今日消耗，例如 `$11.41`
+- `balance`：余额，例如 `$20.00`
+- `average_duration`：平均耗时，例如 `耗时 46.0s`
+- `status`：GPT-5.5 服务状态，例如 `状态 在线`
+- `model`：模型名，例如 `GPT-5.5`
+- `site_name`：站点名，例如 `Lucen`
+
+如果有多个站点，可以指定菜单栏使用哪个站点：
+
+```env
+MENU_BAR_SITE=Lucen
+MENU_BAR_DISPLAY=today_cost
 ```
 
 ### 方式二：使用环境变量

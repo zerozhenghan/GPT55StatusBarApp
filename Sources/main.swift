@@ -7,6 +7,9 @@ private let statusPageURL = URL(string: "https://status.input.im/")!
 private let modelName = "gpt-5.5"
 private let displayModelName = "GPT-5.5"
 private let historyCount = 60
+private let leaderboardURL = URL(string: "https://scys.com/tokenrank/api/subapp/leaderboard")!
+private let leaderboardHandle = "郑韩"
+private let leaderboardUserID = 36449
 
 @main
 struct GPT55StatusBarApp: App {
@@ -37,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configurePopover()
         updateStatusItem()
 
-        Task { await monitor.refresh() }
+        Task { await monitor.refresh(forceLeaderboard: true) }
         scheduleRefreshTimer()
     }
 
@@ -53,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configurePopover() {
         popover.behavior = .transient
         popover.animates = true
-        popover.contentSize = NSSize(width: 332, height: 496)
+        popover.contentSize = NSSize(width: 332, height: 612)
         popover.contentViewController = NSHostingController(
             rootView: DashboardPopoverView(
                 monitor: monitor,
@@ -88,36 +91,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.triggerRefresh()
+                Task { await self?.monitor.refresh(forceLeaderboard: false) }
             }
         }
     }
 
     private func triggerRefresh() {
-        Task { await monitor.refresh() }
+        Task { await monitor.refresh(forceLeaderboard: true) }
     }
 
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
         let snapshot = monitor.snapshot
-        let color: NSColor
-        switch snapshot.mode {
-        case .healthy:
-            color = .systemGreen
-        case .failing:
-            color = .systemRed
-        case .error, .loading:
-            color = .systemOrange
-        }
+        let presentation = menuBarPresentation(snapshot: snapshot, settings: MenuBarSettings.load())
+
+        statusItem.length = NSStatusItem.variableLength
+        button.image = nil
+        button.imagePosition = .noImage
+        button.imageScaling = .scaleProportionallyDown
+        button.toolTip = nil
 
         let title = NSAttributedString(
-            string: displayModelName,
+            string: presentation.title,
             attributes: [
-                .foregroundColor: color,
-                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+                .foregroundColor: presentation.color,
+                .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .medium)
             ]
         )
         button.attributedTitle = title
+    }
+
+    private func menuBarPresentation(snapshot: DashboardSnapshot, settings: MenuBarSettings) -> (title: String, color: NSColor) {
+        switch settings.displayMode {
+        case .model:
+            return (displayModelName, statusMenuColor(snapshot.mode))
+        case .status:
+            return ("状态 \(snapshot.statusText)", statusMenuColor(snapshot.mode))
+        case .siteName:
+            let usage = selectedUsage(from: snapshot, settings: settings)
+            return (usage?.accountName ?? "站点 --", usageMenuColor(usage))
+        case .todayCost:
+            let usage = selectedUsage(from: snapshot, settings: settings)
+            return (menuCurrencyText(usage?.todayCost, unit: usage?.unit ?? "USD"), usageMenuColor(usage))
+        case .balance:
+            let usage = selectedUsage(from: snapshot, settings: settings)
+            return (menuCurrencyText(usage?.remaining, unit: usage?.unit ?? "USD"), usageMenuColor(usage))
+        case .averageDuration:
+            let usage = selectedUsage(from: snapshot, settings: settings)
+            return ("耗时 \(menuDurationText(usage?.averageDurationMs))", usageMenuColor(usage))
+        }
+    }
+
+    private func selectedUsage(from snapshot: DashboardSnapshot, settings: MenuBarSettings) -> UsageSnapshot? {
+        if let siteName = settings.siteName?.lowercased(), !siteName.isEmpty {
+            return snapshot.usages.first { $0.accountName.lowercased() == siteName }
+                ?? snapshot.usages.first { $0.accountName.lowercased().contains(siteName) }
+        }
+        return snapshot.usages.first { $0.mode == .valid } ?? snapshot.usages.first
+    }
+
+    private func statusMenuColor(_ mode: SnapshotMode) -> NSColor {
+        switch mode {
+        case .healthy:
+            return .systemGreen
+        case .failing:
+            return .systemRed
+        case .error, .loading:
+            return .systemOrange
+        }
+    }
+
+    private func usageMenuColor(_ usage: UsageSnapshot?) -> NSColor {
+        guard let usage else { return .systemOrange }
+        switch usage.mode {
+        case .valid:
+            return .systemGreen
+        case .invalid, .error:
+            return .systemRed
+        case .loading, .notConfigured:
+            return .systemOrange
+        }
+    }
+
+    private func menuCurrencyText(_ value: Double?, unit: String) -> String {
+        guard let value else { return "--" }
+        return currencyText(value, unit: unit)
+    }
+
+    private func menuDurationText(_ value: Double?) -> String {
+        guard let value else { return "--" }
+        if value >= 1_000 {
+            return String(format: "%.1fs", value / 1_000)
+        }
+        return "\(Int(value))ms"
     }
 
     @objc private func togglePopover() {
@@ -154,7 +220,8 @@ struct DashboardSnapshot {
     var isStale: Bool = false
     var isRefreshing: Bool = false
     var history: [StatusPoint?] = []
-    var usage: UsageSnapshot = .notConfigured(accountName: "Codex")
+    var usages: [UsageSnapshot] = [.notConfigured(accountName: "Codex")]
+    var leaderboard: LeaderboardSnapshot = .empty
 
     var statusText: String {
         switch mode {
@@ -193,6 +260,48 @@ struct DashboardSnapshot {
     }
 }
 
+struct LeaderboardSnapshot {
+    var rank: Int?
+    var score: Int?
+    var codexScore: Int?
+    var claudeCodeScore: Int?
+    var refreshedAt: Date?
+    var errorMessage: String?
+    var isRefreshing: Bool = false
+
+    var hasData: Bool {
+        rank != nil || score != nil || codexScore != nil || claudeCodeScore != nil
+    }
+
+    static var empty: LeaderboardSnapshot {
+        LeaderboardSnapshot()
+    }
+
+    func loading() -> LeaderboardSnapshot {
+        LeaderboardSnapshot(
+            rank: rank,
+            score: score,
+            codexScore: codexScore,
+            claudeCodeScore: claudeCodeScore,
+            refreshedAt: refreshedAt,
+            errorMessage: nil,
+            isRefreshing: true
+        )
+    }
+
+    func failed(message: String) -> LeaderboardSnapshot {
+        LeaderboardSnapshot(
+            rank: rank,
+            score: score,
+            codexScore: codexScore,
+            claudeCodeScore: claudeCodeScore,
+            refreshedAt: refreshedAt,
+            errorMessage: message,
+            isRefreshing: false
+        )
+    }
+}
+
 enum UsageMode {
     case notConfigured
     case loading
@@ -212,6 +321,7 @@ struct UsageSnapshot {
     var weekLimit: Double?
     var month: Double?
     var monthLimit: Double?
+    var averageDurationMs: Double?
     var expiresAt: Date?
     var lastSuccessAt: Date?
     var errorMessage: String?
@@ -247,6 +357,7 @@ struct UsageSnapshot {
             weekLimit: nil,
             month: nil,
             monthLimit: nil,
+            averageDurationMs: nil,
             expiresAt: nil,
             lastSuccessAt: nil,
             errorMessage: "未配置 API Key"
@@ -265,6 +376,7 @@ struct UsageSnapshot {
             weekLimit: weekLimit,
             month: month,
             monthLimit: monthLimit,
+            averageDurationMs: averageDurationMs,
             expiresAt: expiresAt,
             lastSuccessAt: lastSuccessAt,
             errorMessage: nil
@@ -283,6 +395,7 @@ struct UsageSnapshot {
             weekLimit: weekLimit,
             month: month,
             monthLimit: monthLimit,
+            averageDurationMs: averageDurationMs,
             expiresAt: expiresAt,
             lastSuccessAt: lastSuccessAt,
             errorMessage: message
@@ -294,6 +407,10 @@ struct UsageConfig: Decodable {
     var name: String
     var baseURL: URL
     var apiKey: String
+
+    var id: String {
+        "\(name)-\(baseURL.absoluteString)"
+    }
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -310,11 +427,22 @@ struct UsageConfig: Decodable {
         configDirectory.appendingPathComponent("config.json")
     }
 
-    static func load() -> UsageConfig? {
+    static func loadAll() -> [UsageConfig] {
         let env = ProcessInfo.processInfo.environment
-        if let apiKey = env["INPUT_IM_API_KEY"], !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        var configs: [UsageConfig] = []
+
+        if let apiKey = cleanKey(env["INPUT_IM_API_KEY"] ?? env["OPENAI_API_KEY"]) {
             let baseURL = URL(string: env["INPUT_IM_BASE_URL"] ?? "https://ai.input.im")!
-            return UsageConfig(name: env["INPUT_IM_ACCOUNT_NAME"] ?? "Codex", baseURL: baseURL, apiKey: apiKey)
+            configs.append(UsageConfig(name: env["INPUT_IM_ACCOUNT_NAME"] ?? "Codex", baseURL: baseURL, apiKey: apiKey))
+        }
+
+        if let apiKey = cleanKey(env["LUCEN_API_KEY"] ?? env["LUCEN_CC_API_KEY"]) {
+            let baseURL = URL(string: env["LUCEN_BASE_URL"] ?? "https://lucen.cc")!
+            configs.append(UsageConfig(name: env["LUCEN_ACCOUNT_NAME"] ?? "Lucen", baseURL: baseURL, apiKey: apiKey))
+        }
+
+        if !configs.isEmpty {
+            return unique(configs)
         }
 
         if let envFile = loadEnvFile() {
@@ -325,12 +453,16 @@ struct UsageConfig: Decodable {
               let config = try? JSONDecoder().decode(UsageConfig.self, from: data),
               !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !config.apiKey.contains("在这里填写") else {
-            return nil
+            return []
         }
-        return config
+        return [config]
     }
 
-    private static func loadEnvFile() -> UsageConfig? {
+    private static func load() -> UsageConfig? {
+        loadAll().first
+    }
+
+    private static func loadEnvFile() -> [UsageConfig]? {
         let bundlePath = Bundle.main.bundleURL.deletingLastPathComponent().path
         let candidates = [
             bundlePath + "/账号配置.env",
@@ -344,14 +476,15 @@ struct UsageConfig: Decodable {
             let url = URL(fileURLWithPath: path)
             guard FileManager.default.fileExists(atPath: url.path),
                   let content = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            if let config = parseEnv(content) {
-                return config
+            let configs = parseEnv(content)
+            if !configs.isEmpty {
+                return configs
             }
         }
         return nil
     }
 
-    private static func parseEnv(_ content: String) -> UsageConfig? {
+    private static func parseEnv(_ content: String) -> [UsageConfig] {
         var values: [String: String] = [:]
         var looseValues: [String] = []
         for raw in content.split(whereSeparator: \.isNewline) {
@@ -370,15 +503,142 @@ struct UsageConfig: Decodable {
             }
         }
 
-        let apiKey = values["INPUT_IM_API_KEY"] ?? values["OPENAI_API_KEY"] ?? values["API_KEY"] ?? looseValues.first
-        guard let apiKey, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let baseURLString = values["INPUT_IM_BASE_URL"] ?? values["BASE_URL"] ?? "https://ai.input.im"
-        let baseURL = URL(string: baseURLString) ?? URL(string: "https://ai.input.im")!
-        return UsageConfig(
-            name: values["INPUT_IM_ACCOUNT_NAME"] ?? values["ACCOUNT_NAME"] ?? "Codex",
-            baseURL: baseURL,
-            apiKey: apiKey
+        var configs: [UsageConfig] = []
+
+        if let apiKey = cleanKey(values["INPUT_IM_API_KEY"] ?? values["OPENAI_API_KEY"]) {
+            let baseURL = URL(string: values["INPUT_IM_BASE_URL"] ?? "https://ai.input.im") ?? URL(string: "https://ai.input.im")!
+            configs.append(UsageConfig(
+                name: values["INPUT_IM_ACCOUNT_NAME"] ?? "Codex",
+                baseURL: baseURL,
+                apiKey: apiKey
+            ))
+        }
+
+        if let apiKey = cleanKey(values["LUCEN_API_KEY"] ?? values["LUCEN_CC_API_KEY"]) {
+            let baseURL = URL(string: values["LUCEN_BASE_URL"] ?? "https://lucen.cc") ?? URL(string: "https://lucen.cc")!
+            configs.append(UsageConfig(
+                name: values["LUCEN_ACCOUNT_NAME"] ?? "Lucen",
+                baseURL: baseURL,
+                apiKey: apiKey
+            ))
+        }
+
+        if configs.isEmpty, let apiKey = cleanKey(values["API_KEY"] ?? looseValues.first) {
+            let explicitBaseURL = values["BASE_URL"] ?? values["INPUT_IM_BASE_URL"] ?? values["LUCEN_BASE_URL"]
+            let baseURLString = explicitBaseURL ?? "https://lucen.cc"
+            let defaultName = explicitBaseURL == nil ? "Lucen" : "Codex"
+            let baseURL = URL(string: baseURLString) ?? URL(string: "https://lucen.cc")!
+            configs.append(UsageConfig(
+                name: values["ACCOUNT_NAME"] ?? defaultName,
+                baseURL: baseURL,
+                apiKey: apiKey
+            ))
+        }
+
+        return unique(configs)
+    }
+
+    private static func cleanKey(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              !trimmed.contains("在这里填写") else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func unique(_ configs: [UsageConfig]) -> [UsageConfig] {
+        var seen: Set<String> = []
+        return configs.filter { config in
+            let key = config.id
+            guard !seen.contains(key) else { return false }
+            seen.insert(key)
+            return true
+        }
+    }
+}
+
+enum MenuBarDisplayMode: String {
+    case todayCost = "today_cost"
+    case balance
+    case averageDuration = "average_duration"
+    case status
+    case model
+    case siteName = "site_name"
+}
+
+struct MenuBarSettings {
+    var displayMode: MenuBarDisplayMode = .todayCost
+    var siteName: String?
+
+    static func load() -> MenuBarSettings {
+        let env = ProcessInfo.processInfo.environment
+        var settings = MenuBarSettings(
+            displayMode: MenuBarDisplayMode(rawValue: normalize(env["MENU_BAR_DISPLAY"])) ?? .todayCost,
+            siteName: clean(env["MENU_BAR_SITE"])
         )
+
+        if let values = loadEnvValues() {
+            if let mode = MenuBarDisplayMode(rawValue: normalize(values["MENU_BAR_DISPLAY"])) {
+                settings.displayMode = mode
+            }
+            if let siteName = clean(values["MENU_BAR_SITE"]) {
+                settings.siteName = siteName
+            }
+        }
+
+        return settings
+    }
+
+    private static func loadEnvValues() -> [String: String]? {
+        let bundlePath = Bundle.main.bundleURL.deletingLastPathComponent().path
+        let candidates = [
+            bundlePath + "/账号配置.env",
+            bundlePath + "/../账号配置.env",
+            FileManager.default.currentDirectoryPath + "/账号配置.env",
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/ai 编程项目/小工具/GPT55StatusBarApp/账号配置.env").path,
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/账号配置.env").path
+        ]
+
+        for path in candidates {
+            let url = URL(fileURLWithPath: path)
+            guard FileManager.default.fileExists(atPath: url.path),
+                  let content = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            return parseEnvValues(content)
+        }
+        return nil
+    }
+
+    private static func parseEnvValues(_ content: String) -> [String: String] {
+        var values: [String: String] = [:]
+        for raw in content.split(whereSeparator: \.isNewline) {
+            var line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            if line.hasPrefix("export ") {
+                line = String(line.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<eq].trimmingCharacters(in: .whitespacesAndNewlines))
+            let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            values[key] = value
+        }
+        return values
+    }
+
+    private static func normalize(_ value: String?) -> String {
+        clean(value)?
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_") ?? ""
+    }
+
+    private static func clean(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 }
 
@@ -387,37 +647,56 @@ final class StatusMonitor: ObservableObject {
     @Published private(set) var snapshot = DashboardSnapshot.loading
     var onChange: (() -> Void)?
 
-    private var usageConfig = UsageConfig.load()
+    private var usageConfigs = UsageConfig.loadAll()
 
-    func refresh() async {
-        usageConfig = UsageConfig.load()
+    func refresh(forceLeaderboard: Bool = false) async {
+        usageConfigs = UsageConfig.loadAll()
         var loadingSnapshot = snapshot
         loadingSnapshot.isRefreshing = true
-        if let usageConfig {
-            loadingSnapshot.usage = loadingSnapshot.usage.accountName == usageConfig.name
-                ? loadingSnapshot.usage.loading()
-                : UsageSnapshot.notConfigured(accountName: usageConfig.name).loading()
+        if usageConfigs.isEmpty {
+            loadingSnapshot.usages = [.notConfigured(accountName: snapshot.usages.first?.accountName ?? "Codex")]
         } else {
-            loadingSnapshot.usage = .notConfigured(accountName: snapshot.usage.accountName)
+            loadingSnapshot.usages = usageConfigs.map { config in
+                let previous = snapshot.usages.first { $0.accountName == config.name }
+                return previous?.loading() ?? UsageSnapshot.notConfigured(accountName: config.name).loading()
+            }
+        }
+        if shouldRefreshLeaderboard(force: forceLeaderboard, snapshot: snapshot.leaderboard) {
+            loadingSnapshot.leaderboard = loadingSnapshot.leaderboard.loading()
         }
         snapshot = loadingSnapshot
         onChange?()
 
         var nextSnapshot: DashboardSnapshot
         do {
-            nextSnapshot = try await loadStatusSnapshot(keepingUsage: snapshot.usage)
+            nextSnapshot = try await loadStatusSnapshot(keepingUsages: snapshot.usages)
         } catch {
             nextSnapshot = failedRefreshSnapshot(from: snapshot, message: "刷新失败，显示上次数据")
         }
 
-        if let usageConfig {
+        if usageConfigs.isEmpty {
+            nextSnapshot.usages = [.notConfigured(accountName: "Codex")]
+        } else {
+            var loadedUsages: [UsageSnapshot] = []
+            for config in usageConfigs {
+                let previous = nextSnapshot.usages.first { $0.accountName == config.name } ?? .notConfigured(accountName: config.name)
+                do {
+                    loadedUsages.append(try await loadUsageSnapshot(config: config, previous: previous))
+                } catch {
+                    loadedUsages.append(previous.failed(message: "用量读取失败"))
+                }
+            }
+            nextSnapshot.usages = loadedUsages
+        }
+
+        if shouldRefreshLeaderboard(force: forceLeaderboard, snapshot: snapshot.leaderboard) {
             do {
-                nextSnapshot.usage = try await loadUsageSnapshot(config: usageConfig, previous: nextSnapshot.usage)
+                nextSnapshot.leaderboard = try await loadLeaderboardSnapshot(previous: nextSnapshot.leaderboard)
             } catch {
-                nextSnapshot.usage = nextSnapshot.usage.failed(message: "用量读取失败")
+                nextSnapshot.leaderboard = snapshot.leaderboard.failed(message: "排行刷新失败")
             }
         } else {
-            nextSnapshot.usage = .notConfigured(accountName: "Codex")
+            nextSnapshot.leaderboard = snapshot.leaderboard
         }
 
         nextSnapshot.isRefreshing = false
@@ -426,7 +705,13 @@ final class StatusMonitor: ObservableObject {
         onChange?()
     }
 
-    private func loadStatusSnapshot(keepingUsage usage: UsageSnapshot) async throws -> DashboardSnapshot {
+    private func shouldRefreshLeaderboard(force: Bool, snapshot: LeaderboardSnapshot) -> Bool {
+        if force { return true }
+        guard let refreshedAt = snapshot.refreshedAt else { return true }
+        return Date().timeIntervalSince(refreshedAt) >= 3600
+    }
+
+    private func loadStatusSnapshot(keepingUsages usages: [UsageSnapshot]) async throws -> DashboardSnapshot {
         var request = URLRequest(url: apiURL, timeoutInterval: 12)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("GPT55StatusBarApp", forHTTPHeaderField: "User-Agent")
@@ -450,7 +735,7 @@ final class StatusMonitor: ObservableObject {
                 isStale: false,
                 isRefreshing: false,
                 history: [],
-                usage: usage
+                usages: usages
             )
         }
 
@@ -467,12 +752,18 @@ final class StatusMonitor: ObservableObject {
             isStale: false,
             isRefreshing: false,
             history: recentHistory(from: service.history),
-            usage: usage
+            usages: usages
         )
     }
 
     private func loadUsageSnapshot(config: UsageConfig, previous: UsageSnapshot) async throws -> UsageSnapshot {
-        let usageURL = config.baseURL.appendingPathComponent("v1/usage")
+        var components = URLComponents(url: config.baseURL.appendingPathComponent("v1/usage"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "period", value: "today"),
+            URLQueryItem(name: "timezone", value: TimeZone.current.identifier),
+            URLQueryItem(name: "days", value: "30")
+        ]
+        guard let usageURL = components?.url else { throw URLError(.badURL) }
         var request = URLRequest(url: usageURL, timeoutInterval: 12)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
@@ -487,20 +778,106 @@ final class StatusMonitor: ObservableObject {
         let value = try JSONDecoder().decode(JSONValue.self, from: data)
         let isValid = value.bool(at: [["is_active"], ["isValid"], ["valid"], ["subscription", "active"]]) ?? true
         let subscription = value.value(at: [["subscription"]])
+        let currentKeyToday = value.double(at: [["usage", "today", "actual_cost"], ["usage", "today", "cost"]])
+        let currentKeyTotal = value.double(at: [["usage", "total", "actual_cost"], ["usage", "total", "cost"]])
         return UsageSnapshot(
             mode: isValid ? .valid : .invalid,
             accountName: config.name,
             remaining: value.double(at: [["remaining"], ["quota", "remaining"], ["balance"], ["data", "remaining"]]),
             unit: value.string(at: [["unit"], ["quota", "unit"], ["currency"]]) ?? previous.unit,
-            todayCost: subscription?.double(at: [["daily_usage_usd"]]) ?? value.double(at: [["today"], ["today_cost"], ["usage", "today"], ["costs", "today"], ["daily"]]),
+            todayCost: subscription?.double(at: [["daily_usage_usd"]]) ?? currentKeyToday ?? value.double(at: [["today"], ["today_cost"], ["costs", "today"], ["daily"]]),
             todayLimit: subscription?.double(at: [["daily_limit_usd"]]),
-            week: subscription?.double(at: [["weekly_usage_usd"]]) ?? value.double(at: [["week"], ["week_cost"], ["usage", "week"], ["costs", "week"], ["weekly"]]),
+            week: subscription?.double(at: [["weekly_usage_usd"]]) ?? value.double(at: [["week"], ["week_cost"], ["usage", "week"], ["costs", "week"], ["weekly"]]) ?? currentKeyTotal,
             weekLimit: subscription?.double(at: [["weekly_limit_usd"]]),
-            month: subscription?.double(at: [["monthly_usage_usd"]]) ?? value.double(at: [["month"], ["month_cost"], ["usage", "month"], ["costs", "month"], ["monthly"]]),
+            month: subscription?.double(at: [["monthly_usage_usd"]]) ?? value.double(at: [["month"], ["month_cost"], ["usage", "month"], ["costs", "month"], ["monthly"]]) ?? currentKeyTotal,
             monthLimit: subscription?.double(at: [["monthly_limit_usd"]]),
+            averageDurationMs: value.double(at: [["usage", "average_duration_ms"], ["average_duration_ms"]]),
             expiresAt: subscription?.date(at: [["expires_at"]]) ?? value.date(at: [["expires_at"], ["expire_at"], ["subscription", "expires_at"], ["plan", "expires_at"]]),
             lastSuccessAt: Date(),
             errorMessage: nil
+        )
+    }
+
+    private func loadLeaderboardSnapshot(previous: LeaderboardSnapshot) async throws -> LeaderboardSnapshot {
+        var components = URLComponents(url: leaderboardURL, resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "board", value: "total"),
+            URLQueryItem(name: "range", value: "today")
+        ]
+        guard let url = components.url else { throw URLError(.badURL) }
+
+        var request = URLRequest(url: url, timeoutInterval: 12)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("GPT55StatusBarApp", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+
+        let payload = try JSONDecoder().decode(LeaderboardResponse.self, from: data)
+        var entry = payload.entries.first { $0.userId == leaderboardUserID || $0.name == leaderboardHandle }
+        if entry == nil {
+            entry = try? await loadMyLeaderboardEntry()
+        }
+
+        guard let entry else {
+            return LeaderboardSnapshot(
+                rank: nil,
+                score: nil,
+                codexScore: nil,
+                claudeCodeScore: nil,
+                refreshedAt: Date(),
+                errorMessage: "今日暂无排名",
+                isRefreshing: false
+            )
+        }
+
+        return LeaderboardSnapshot(
+            rank: entry.rank,
+            score: entry.score,
+            codexScore: entry.byTool["codex"],
+            claudeCodeScore: entry.byTool["claude-code"],
+            refreshedAt: Date(),
+            errorMessage: nil,
+            isRefreshing: false
+        )
+    }
+
+    private func loadMyLeaderboardEntry() async throws -> LeaderboardEntry? {
+        var components = URLComponents(url: leaderboardURL, resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "board", value: "total"),
+            URLQueryItem(name: "range", value: "today"),
+            URLQueryItem(name: "me", value: String(leaderboardUserID)),
+            URLQueryItem(name: "limit", value: "1")
+        ]
+        guard let url = components.url else { throw URLError(.badURL) }
+
+        var request = URLRequest(url: url, timeoutInterval: 12)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("GPT55StatusBarApp", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+
+        let payload = try JSONDecoder().decode(LeaderboardResponse.self, from: data)
+        if let entry = payload.entries.first(where: { $0.userId == leaderboardUserID || $0.name == leaderboardHandle }) {
+            return entry
+        }
+        guard let myRank = payload.myRank else { return nil }
+        return LeaderboardEntry(
+            rank: myRank.rank,
+            userId: leaderboardUserID,
+            name: leaderboardHandle,
+            score: myRank.score,
+            byTool: myRank.byTool ?? [:],
+            cost: myRank.cost,
+            anomaly: nil
         )
     }
 
@@ -530,7 +907,7 @@ final class StatusMonitor: ObservableObject {
                 isStale: false,
                 isRefreshing: false,
                 history: [],
-                usage: current.usage
+                usages: current.usages
             )
         }
 
@@ -545,7 +922,7 @@ final class StatusMonitor: ObservableObject {
             isStale: true,
             isRefreshing: false,
             history: current.history,
-            usage: current.usage
+            usages: current.usages
         )
     }
 }
@@ -568,6 +945,31 @@ struct StatusSample: Decodable {
     let ok: Bool
     let latency_ms: Int?
     let error: String?
+}
+
+struct LeaderboardResponse: Decodable {
+    let status: Int?
+    let board: String?
+    let range: String?
+    let entries: [LeaderboardEntry]
+    let myRank: LeaderboardRank?
+}
+
+struct LeaderboardRank: Decodable {
+    let rank: Int
+    let score: Int
+    let cost: Double?
+    let byTool: [String: Int]?
+}
+
+struct LeaderboardEntry: Decodable {
+    let rank: Int
+    let userId: Int?
+    let name: String
+    let score: Int
+    let byTool: [String: Int]
+    let cost: Double?
+    let anomaly: Bool?
 }
 
 enum JSONValue: Decodable {
@@ -699,12 +1101,13 @@ struct DashboardPopoverView: View {
         VStack(alignment: .leading, spacing: 14) {
             header(snapshot: snapshot)
             serviceSection(snapshot: snapshot)
-            UsageCardView(usage: snapshot.usage, refreshedAt: snapshot.refreshedAt)
+            UsageCardsView(usages: snapshot.usages, refreshedAt: snapshot.refreshedAt)
+            LeaderboardView(leaderboard: snapshot.leaderboard)
         }
         .padding(.horizontal, 18)
         .padding(.top, 18)
         .padding(.bottom, 18)
-        .frame(width: 332, height: 496, alignment: .top)
+        .frame(width: 332, height: 612, alignment: .top)
         .background(
             LinearGradient(
                 colors: [
@@ -905,53 +1308,51 @@ struct StatusTimelineView: View {
     }
 }
 
-struct UsageCardView: View {
-    let usage: UsageSnapshot
+struct UsageCardsView: View {
+    let usages: [UsageSnapshot]
     let refreshedAt: Date?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button(action: {}) {
-                    Image(systemName: "chevron.left")
-                }
-                .buttonStyle(ArrowButtonStyle())
-                .disabled(true)
-
+                Text("站点用量")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.90))
                 Spacer()
+                Text("\(usages.count) 个站点")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.40))
+            }
 
-                VStack(spacing: 2) {
-                    HStack(spacing: 5) {
-                        BadgeNumber(text: "1")
-                        Text(usage.accountName)
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(Color.white.opacity(0.94))
-                    }
-                    Text("第 1 / 1 个")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(Color.white.opacity(0.34))
+            ForEach(Array(usages.enumerated()), id: \.offset) { index, usage in
+                UsageCardView(usage: usage, index: index + 1, total: usages.count, refreshedAt: refreshedAt)
+            }
+        }
+    }
+}
+
+struct UsageCardView: View {
+    let usage: UsageSnapshot
+    let index: Int
+    let total: Int
+    let refreshedAt: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                HStack(spacing: 6) {
+                    BadgeNumber(text: "\(index)")
+                    Text(usage.accountName)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(Color.white.opacity(0.94))
                 }
-
                 Spacer()
-
-                Button(action: {}) {
-                    Image(systemName: "chevron.right")
-                }
-                .buttonStyle(ArrowButtonStyle())
-                .disabled(true)
+                Text(total > 1 ? "\(index)/\(total)" : "当前站点")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.34))
             }
 
             VStack(alignment: .leading, spacing: 7) {
-                HStack(alignment: .top) {
-                    HStack(spacing: 8) {
-                        BadgeNumber(text: "1")
-                        Text(usage.accountName)
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(Color.white.opacity(0.92))
-                    }
-                    Spacer()
-                }
-
                 Text(usage.mode == .loading ? "正在刷新" : usageStatusLine(usage))
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(Color.white.opacity(0.40))
@@ -978,6 +1379,7 @@ struct UsageCardView: View {
                 UsageLine(label: "今日", value: usageAmountText(usage.todayCost, limit: usage.todayLimit, unit: usage.unit), trailing: nil)
                 UsageLine(label: "本周", value: usageAmountText(usage.week, limit: usage.weekLimit, unit: usage.unit), trailing: nil)
                 UsageLine(label: "本月", value: usageAmountText(usage.month, limit: usage.monthLimit, unit: usage.unit), trailing: nil)
+                UsageLine(label: "耗时", value: durationText(usage.averageDurationMs), trailing: nil)
 
                 Text(expireText(usage.expiresAt))
                     .font(.system(size: 10, weight: .bold))
@@ -991,6 +1393,9 @@ struct UsageCardView: View {
                 }
             }
         }
+        .padding(12)
+        .background(Color.white.opacity(0.07))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private func usageStatusLine(_ usage: UsageSnapshot) -> String {
@@ -1018,6 +1423,14 @@ struct UsageCardView: View {
         guard let date else { return "有效期 --" }
         return dateText(date)
     }
+
+    private func durationText(_ value: Double?) -> String {
+        guard let value else { return "--" }
+        if value >= 1_000 {
+            return String(format: "%.1fs", value / 1_000)
+        }
+        return "\(Int(value))ms"
+    }
 }
 
 struct UsageLine: View {
@@ -1044,6 +1457,70 @@ struct UsageLine: View {
                     .foregroundStyle(Color.white.opacity(0.38))
             }
         }
+    }
+}
+
+struct LeaderboardView: View {
+    let leaderboard: LeaderboardSnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("今日排行")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.90))
+
+                Spacer()
+
+                Text(statusText)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(statusColor)
+            }
+
+            if leaderboard.hasData {
+                HStack(spacing: 14) {
+                    LeaderboardMetric(label: "总量", value: compactNumber(leaderboard.score))
+                    LeaderboardMetric(label: "codex", value: compactNumber(leaderboard.codexScore))
+                    LeaderboardMetric(label: "claude-code", value: compactNumber(leaderboard.claudeCodeScore))
+                }
+            } else {
+                Text(leaderboard.errorMessage ?? "等待刷新")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.34))
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private var statusText: String {
+        if leaderboard.isRefreshing { return "刷新中" }
+        if let rank = leaderboard.rank { return "#\(rank)" }
+        return "--"
+    }
+
+    private var statusColor: Color {
+        if leaderboard.isRefreshing { return .orange }
+        if leaderboard.rank != nil { return .green }
+        return .white.opacity(0.42)
+    }
+}
+
+struct LeaderboardMetric: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(Color.white.opacity(0.36))
+            Text(value)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.90))
+                .lineLimit(1)
+                .minimumScaleFactor(0.80)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1097,6 +1574,17 @@ private func currencyText(_ value: Double, unit: String) -> String {
     return "\(symbol)\(String(format: "%.2f", value))"
 }
 
+private func compactNumber(_ value: Int?) -> String {
+    guard let value else { return "--" }
+    if value >= 100_000_000 {
+        return String(format: "%.2f亿", Double(value) / 100_000_000)
+    }
+    if value >= 10_000 {
+        return String(format: "%.1f万", Double(value) / 10_000)
+    }
+    return Formatters.integer.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
 private enum Formatters {
     static let time: DateFormatter = {
         let formatter = DateFormatter()
@@ -1111,6 +1599,22 @@ private enum Formatters {
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
         formatter.dateFormat = "yyyy年M月d日"
+        return formatter
+    }()
+
+    static let leaderboardDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    static let integer: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 0
         return formatter
     }()
 }
