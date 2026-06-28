@@ -799,24 +799,7 @@ final class StatusMonitor: ObservableObject {
     }
 
     private func loadLeaderboardSnapshot(previous: LeaderboardSnapshot) async throws -> LeaderboardSnapshot {
-        var components = URLComponents(url: leaderboardURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
-            URLQueryItem(name: "board", value: "total"),
-            URLQueryItem(name: "range", value: "today")
-        ]
-        guard let url = components.url else { throw URLError(.badURL) }
-
-        var request = URLRequest(url: url, timeoutInterval: 12)
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("GPT55StatusBarApp", forHTTPHeaderField: "User-Agent")
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        if let httpResponse = response as? HTTPURLResponse,
-           !(200...299).contains(httpResponse.statusCode) {
-            throw URLError(.badServerResponse)
-        }
-
-        let payload = try JSONDecoder().decode(LeaderboardResponse.self, from: data)
+        let payload = try await loadLeaderboardPayload(board: "total", includeMe: false)
         var entry = payload.entries.first { $0.userId == leaderboardUserID || $0.name == leaderboardHandle }
         if entry == nil {
             entry = try? await loadMyLeaderboardEntry()
@@ -845,14 +828,18 @@ final class StatusMonitor: ObservableObject {
         )
     }
 
-    private func loadMyLeaderboardEntry() async throws -> LeaderboardEntry? {
+    private func loadLeaderboardPayload(board: String, includeMe: Bool) async throws -> LeaderboardResponse {
         var components = URLComponents(url: leaderboardURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        var queryItems = [
             URLQueryItem(name: "board", value: "total"),
-            URLQueryItem(name: "range", value: "today"),
-            URLQueryItem(name: "me", value: String(leaderboardUserID)),
-            URLQueryItem(name: "limit", value: "1")
+            URLQueryItem(name: "range", value: "today")
         ]
+        queryItems[0] = URLQueryItem(name: "board", value: board)
+        if includeMe {
+            queryItems.append(URLQueryItem(name: "me", value: String(leaderboardUserID)))
+            queryItems.append(URLQueryItem(name: "limit", value: "1"))
+        }
+        components.queryItems = queryItems
         guard let url = components.url else { throw URLError(.badURL) }
 
         var request = URLRequest(url: url, timeoutInterval: 12)
@@ -865,20 +852,35 @@ final class StatusMonitor: ObservableObject {
             throw URLError(.badServerResponse)
         }
 
-        let payload = try JSONDecoder().decode(LeaderboardResponse.self, from: data)
+        return try JSONDecoder().decode(LeaderboardResponse.self, from: data)
+    }
+
+    private func loadMyLeaderboardEntry() async throws -> LeaderboardEntry? {
+        let payload = try await loadLeaderboardPayload(board: "total", includeMe: true)
         if let entry = payload.entries.first(where: { $0.userId == leaderboardUserID || $0.name == leaderboardHandle }) {
             return entry
         }
         guard let myRank = payload.myRank else { return nil }
+        var byTool: [String: Int] = [:]
+        byTool["codex"] = try? await loadMyToolScore(board: "codex")
+        byTool["claude-code"] = try? await loadMyToolScore(board: "claude-code")
         return LeaderboardEntry(
             rank: myRank.rank,
             userId: leaderboardUserID,
             name: leaderboardHandle,
             score: myRank.score,
-            byTool: myRank.byTool ?? [:],
+            byTool: myRank.byTool ?? byTool,
             cost: myRank.cost,
             anomaly: nil
         )
+    }
+
+    private func loadMyToolScore(board: String) async throws -> Int {
+        let payload = try await loadLeaderboardPayload(board: board, includeMe: true)
+        if let entry = payload.entries.first(where: { $0.userId == leaderboardUserID || $0.name == leaderboardHandle }) {
+            return entry.score
+        }
+        return payload.myRank?.score ?? 0
     }
 
     private func date(from timestamp: Int?) -> Date? {
