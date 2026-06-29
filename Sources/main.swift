@@ -10,6 +10,7 @@ private let historyCount = 60
 private let leaderboardURL = URL(string: "https://scys.com/tokenrank/api/subapp/leaderboard")!
 private let leaderboardHandle = "郑韩"
 private let leaderboardUserID = 36449
+private let gatewayStatusURL = URL(string: "http://127.0.0.1:4610/__codex_retry_gateway/api/status")!
 
 @main
 struct GPT55StatusBarApp: App {
@@ -56,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configurePopover() {
         popover.behavior = .transient
         popover.animates = true
-        popover.contentSize = NSSize(width: 332, height: 612)
+        popover.contentSize = NSSize(width: 332, height: 628)
         popover.contentViewController = NSHostingController(
             rootView: DashboardPopoverView(
                 monitor: monitor,
@@ -209,6 +210,13 @@ struct StatusPoint {
     var latencyMs: Int?
 }
 
+struct GatewayMetricsSnapshot {
+    var proxyRequestCount: Int
+    var blockedResponseCount: Int
+    var blockedRatio: Double
+    var refreshedAt: Date
+}
+
 struct DashboardSnapshot {
     var mode: SnapshotMode = .loading
     var uptimePct: Double?
@@ -222,6 +230,7 @@ struct DashboardSnapshot {
     var history: [StatusPoint?] = []
     var usages: [UsageSnapshot] = [.notConfigured(accountName: "Codex")]
     var leaderboard: LeaderboardSnapshot = .empty
+    var gatewayMetrics: GatewayMetricsSnapshot?
 
     var statusText: String {
         switch mode {
@@ -699,6 +708,7 @@ final class StatusMonitor: ObservableObject {
             nextSnapshot.leaderboard = snapshot.leaderboard
         }
 
+        nextSnapshot.gatewayMetrics = (try? await loadGatewayMetrics()) ?? snapshot.gatewayMetrics
         nextSnapshot.isRefreshing = false
         nextSnapshot.refreshedAt = Date()
         snapshot = nextSnapshot
@@ -735,7 +745,8 @@ final class StatusMonitor: ObservableObject {
                 isStale: false,
                 isRefreshing: false,
                 history: [],
-                usages: usages
+                usages: usages,
+                gatewayMetrics: snapshot.gatewayMetrics
             )
         }
 
@@ -752,7 +763,32 @@ final class StatusMonitor: ObservableObject {
             isStale: false,
             isRefreshing: false,
             history: recentHistory(from: service.history),
-            usages: usages
+            usages: usages,
+            gatewayMetrics: snapshot.gatewayMetrics
+        )
+    }
+
+    private func loadGatewayMetrics() async throws -> GatewayMetricsSnapshot {
+        var request = URLRequest(url: gatewayStatusURL, timeoutInterval: 3)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("GPT55StatusBarApp", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+
+        let value = try JSONDecoder().decode(JSONValue.self, from: data)
+        let proxyRequestCount = value.int(at: [["metrics", "total_proxy_request_count"]]) ?? 0
+        let blockedResponseCount = value.int(at: [["metrics", "blocked_response_count"]]) ?? 0
+        let inspectedResponseCount = value.int(at: [["metrics", "inspected_response_count"]]) ?? 0
+        let ratio = inspectedResponseCount == 0 ? 0 : Double(blockedResponseCount) / Double(inspectedResponseCount)
+        return GatewayMetricsSnapshot(
+            proxyRequestCount: proxyRequestCount,
+            blockedResponseCount: blockedResponseCount,
+            blockedRatio: ratio,
+            refreshedAt: Date()
         )
     }
 
@@ -909,7 +945,8 @@ final class StatusMonitor: ObservableObject {
                 isStale: false,
                 isRefreshing: false,
                 history: [],
-                usages: current.usages
+                usages: current.usages,
+                gatewayMetrics: current.gatewayMetrics
             )
         }
 
@@ -924,7 +961,8 @@ final class StatusMonitor: ObservableObject {
             isStale: true,
             isRefreshing: false,
             history: current.history,
-            usages: current.usages
+            usages: current.usages,
+            gatewayMetrics: current.gatewayMetrics
         )
     }
 }
@@ -1103,13 +1141,13 @@ struct DashboardPopoverView: View {
         VStack(alignment: .leading, spacing: 14) {
             header(snapshot: snapshot)
             serviceSection(snapshot: snapshot)
-            UsageCardsView(usages: snapshot.usages, refreshedAt: snapshot.refreshedAt)
+            UsageCardsView(usages: snapshot.usages, gatewayMetrics: snapshot.gatewayMetrics, refreshedAt: snapshot.refreshedAt)
             LeaderboardView(leaderboard: snapshot.leaderboard)
         }
         .padding(.horizontal, 18)
         .padding(.top, 18)
         .padding(.bottom, 18)
-        .frame(width: 332, height: 612, alignment: .top)
+        .frame(width: 332, height: 628, alignment: .top)
         .background(
             LinearGradient(
                 colors: [
@@ -1135,14 +1173,6 @@ struct DashboardPopoverView: View {
                 Text("用量监控")
                     .font(.system(size: 17, weight: .bold))
                     .foregroundStyle(Color.white.opacity(0.95))
-
-                Text("1 个模型")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.48))
-
-                Text(snapshot.isRefreshing ? "正在刷新" : refreshSummary(snapshot))
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.44))
             }
 
             Spacer()
@@ -1312,10 +1342,15 @@ struct StatusTimelineView: View {
 
 struct UsageCardsView: View {
     let usages: [UsageSnapshot]
+    let gatewayMetrics: GatewayMetricsSnapshot?
     let refreshedAt: Date?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
+            if let gatewayMetrics {
+                GatewayMetricsView(metrics: gatewayMetrics)
+            }
+
             HStack {
                 Text("站点用量")
                     .font(.system(size: 11, weight: .bold))
@@ -1330,6 +1365,42 @@ struct UsageCardsView: View {
                 UsageCardView(usage: usage, index: index + 1, total: usages.count, refreshedAt: refreshedAt)
             }
         }
+    }
+}
+
+struct GatewayMetricsView: View {
+    let metrics: GatewayMetricsSnapshot
+
+    var body: some View {
+        HStack(spacing: 12) {
+            GatewayMetric(label: "代理请求", value: "\(metrics.proxyRequestCount)")
+            GatewayMetric(label: "实际拦截", value: "\(metrics.blockedResponseCount)")
+            GatewayMetric(label: "拦截占比", value: percentText(metrics.blockedRatio))
+        }
+        .padding(.top, 1)
+    }
+
+    private func percentText(_ value: Double) -> String {
+        String(format: "%.2f%%", value * 100)
+    }
+}
+
+struct GatewayMetric: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(Color.white.opacity(0.38))
+            Text(value)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.92))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1349,31 +1420,12 @@ struct UsageCardView: View {
                         .foregroundStyle(Color.white.opacity(0.94))
                 }
                 Spacer()
-                Text(total > 1 ? "\(index)/\(total)" : "当前站点")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.34))
+                Text(usage.validityText)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(usage.validityColor)
             }
 
             VStack(alignment: .leading, spacing: 7) {
-                Text(usage.mode == .loading ? "正在刷新" : usageStatusLine(usage))
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.40))
-
-                Text("上次成功刷新 \(timeText(usage.lastSuccessAt ?? refreshedAt))")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.40))
-
-                HStack {
-                    Text("GPT-5.5 状态查询")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(Color.white.opacity(0.94))
-                    Spacer()
-                    Text(usage.validityText)
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(usage.validityColor)
-                }
-                .padding(.top, 2)
-
                 Text("订阅")
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(Color.white.opacity(0.90))
@@ -1395,19 +1447,7 @@ struct UsageCardView: View {
                 }
             }
         }
-        .padding(12)
-        .background(Color.white.opacity(0.07))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private func usageStatusLine(_ usage: UsageSnapshot) -> String {
-        switch usage.mode {
-        case .valid: return "用量数据已同步"
-        case .invalid: return "Key 状态无效"
-        case .notConfigured: return "未配置用量 Key"
-        case .error: return "用量读取失败"
-        case .loading: return "正在刷新"
-        }
+        .padding(.vertical, 4)
     }
 
     private func moneyText(_ value: Double?, unit: String) -> String {
